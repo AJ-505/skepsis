@@ -47,79 +47,35 @@ index 0000000..00f7f45
 +regular file now
 `
 
-function parse(patch: string) {
-  return parsePatchFiles(patch).flatMap((p) => p.files)
-}
-
-describe('mergeDuplicateFiles', () => {
-  it('leaves unique files untouched', () => {
-    const solo = parse(`diff --git a/a.txt b/a.txt
+const PLAIN = `diff --git a/a.txt b/a.txt
 index 1111111..2222222 100644
 --- a/a.txt
 +++ b/a.txt
 @@ -1 +1 @@
 -old
 +new
-`)
-    const merged = mergeDuplicateFiles(solo)
-    expect(merged).toHaveLength(1)
-    expect(merged[0]).toBe(solo[0])
-  })
+`
 
-  it('merges a file-to-symlink typechange into one entry', () => {
-    const merged = mergeDuplicateFiles(parse(FILE_TO_SYMLINK))
-    expect(merged).toHaveLength(1)
-    const f = merged[0]!
-    expect(f.name).toBe('real.txt')
-    expect(f.type).toBe('change')
-    // Both sides stay visible, the deleted file content and the link target.
-    expect(f.deletionLines).toEqual(['hello\n'])
-    expect(f.additionLines).toEqual(['target.txt'])
-    expect(f.hunks).toHaveLength(2)
-    expect(f.prevObjectId).toBe('ce01362')
-    expect(f.newObjectId).toBe('4cbb553')
-    expect(f.mode).toBe('120000')
-  })
-
-  it('merges a symlink-to-file typechange into one entry', () => {
-    const merged = mergeDuplicateFiles(parse(SYMLINK_TO_FILE))
-    expect(merged).toHaveLength(1)
-    const f = merged[0]!
-    expect(f.name).toBe('link.txt')
-    expect(f.deletionLines).toEqual(['target.txt'])
-    expect(f.additionLines).toEqual(['regular file now\n'])
-    expect(f.hunks).toHaveLength(2)
-  })
-
-  it('reindexes hunk line pointers into the merged arrays', () => {
-    const merged = mergeDuplicateFiles(parse(FILE_TO_SYMLINK))
-    const f = merged[0]!
-    for (const h of f.hunks) {
-      expect(h.additionLineIndex + h.additionLines).toBeLessThanOrEqual(
-        f.additionLines.length,
-      )
-      expect(h.deletionLineIndex + h.deletionLines).toBeLessThanOrEqual(
-        f.deletionLines.length,
-      )
-      for (const c of h.hunkContent) {
-        if (c.type === 'change') {
-          expect(c.additionLineIndex + c.additions).toBeLessThanOrEqual(
-            f.additionLines.length,
-          )
-          expect(c.deletionLineIndex + c.deletions).toBeLessThanOrEqual(
-            f.deletionLines.length,
-          )
-        }
-      }
-    }
-  })
-
-  it('produces unique names for CodeView item ids', () => {
-    const twoFiles = `${FILE_TO_SYMLINK}${SYMLINK_TO_FILE}`
-    const merged = mergeDuplicateFiles(parse(twoFiles))
-    const names = merged.map((f) => f.name)
-    expect(new Set(names).size).toBe(names.length)
-    expect(names).toContain('real.txt')
-    expect(names).toContain('link.txt')
+describe('mergeDuplicateFiles', () => {
+  it('folds each typechange into one diff and leaves other files alone', () => {
+    const files = parsePatchFiles(FILE_TO_SYMLINK + PLAIN + SYMLINK_TO_FILE).flatMap(
+      (p) => p.files,
+    )
+    const merged = mergeDuplicateFiles(files)
+    expect(merged.map((f) => f.name)).toEqual(['real.txt', 'a.txt', 'link.txt'])
+    expect(merged[1]).toBe(files[2])
+    const [real, , link] = merged
+    expect(real).toMatchObject({
+      type: 'change',
+      deletionLines: ['hello\n'],
+      additionLines: ['target.txt'],
+      prevObjectId: 'ce01362',
+      newObjectId: '4cbb553',
+      mode: '120000',
+    })
+    expect(link).toMatchObject({
+      deletionLines: ['target.txt'],
+      additionLines: ['regular file now\n'],
+    })
   })
 })

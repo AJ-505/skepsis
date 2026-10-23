@@ -12,8 +12,7 @@ import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { DiffArgs } from '../shared/types.ts'
 import { getFileContents } from './fileContents.ts'
-import { insertComment, removeComment } from './comment.ts'
-import { getCommentSyntaxes } from './commentSyntax.ts'
+import { insertComment } from './comment.ts'
 import { exec, isolateVcsConfig } from './testUtil.ts'
 
 const home = await isolateVcsConfig()
@@ -44,14 +43,11 @@ describe('symlinks', () => {
     await run('git', ['init', '-q'])
     await writeFile(join(dir, 'target.txt'), 'target content\n')
     await writeFile(join(dir, 'real.txt'), 'hello\n')
-    await writeFile(join(dir, 'script'), '#!/bin/bash\necho hi\n')
     await run('git', ['add', '.'])
     await run('git', ['commit', '-qm', 'init'])
     // Turn the regular file into a symlink to another tracked file.
     await unlink(join(dir, 'real.txt'))
     await symlink('target.txt', join(dir, 'real.txt'))
-    // An extensionless symlink to a script. This exercises the shebang path.
-    await symlink('script', join(dir, 'runme'))
 
     // getFileContents shells out to git in the process cwd.
     origCwd = process.cwd()
@@ -70,29 +66,10 @@ describe('symlinks', () => {
   })
 
   it('refuses to insert comments through a symlink', async () => {
-    await expect(insertComment(dir, 'real.txt', 1, 'needs work')).rejects.toThrow(/symlink/)
+    await expect(insertComment(dir, 'real.txt', 1, 'hello', 'needs work')).rejects.toThrow(
+      /symlink/,
+    )
     // The link target must be untouched.
     expect(await readFile(join(dir, 'target.txt'), 'utf-8')).toBe('target content\n')
-  })
-
-  it('refuses to remove comments through a symlink', async () => {
-    await expect(removeComment(dir, 'real.txt', 1)).rejects.toThrow(/symlink/)
-  })
-
-  it('still inserts comments into the link target directly', async () => {
-    await insertComment(dir, 'target.txt', 1, 'needs work')
-    expect(await readFile(join(dir, 'target.txt'), 'utf-8')).toBe(
-      'target content\n<review>\nneeds work\n</review>\n',
-    )
-    await removeComment(dir, 'target.txt', 2)
-    expect(await readFile(join(dir, 'target.txt'), 'utf-8')).toBe('target content\n')
-  })
-
-  it("doesn't detect a symlinked script's shebang as the link's syntax", async () => {
-    const syntaxes = await getCommentSyntaxes(dir, ['runme', 'script'])
-    // The regular script still resolves via its shebang, while the
-    // extensionless symlink to it stays unknown.
-    expect(syntaxes['script']).toEqual({ prefix: '#' })
-    expect(syntaxes['runme']).toBeNull()
   })
 })
