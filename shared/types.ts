@@ -28,6 +28,9 @@ export const viewedDeleteAllSchema = z.object({
 export const commentRequestSchema = z.object({
   file: z.string(),
   afterLine: z.number(),
+  /** What the page shows at afterLine, so a file that changed since the diff
+   *  loaded can't take the comment on the wrong line. */
+  lineText: z.string(),
   text: z.string(),
 })
 
@@ -100,6 +103,10 @@ export interface DiffResponse {
    *  file contents for hunk expansion. */
   expandable: boolean
   fileHashes: FileHashes
+  /** Hash of `patch`, compared against /api/diff-hash to notice changes. */
+  patchHash: string
+  /** Whether the page should poll /api/diff-hash (off with --no-poll). */
+  poll: boolean
   viewed: ViewedMap
   /** Per-file comment syntax, shown in the comment form. An empty prefix
    *  means the format has no comment syntax (e.g. plain text); null means the
@@ -123,4 +130,8 @@ export interface ErrorResponse {
 
 export interface OkResponse {
   ok: true
+}
+
+export interface DiffHashResponse {
+  hash: string
 }

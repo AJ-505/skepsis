@@ -10,7 +10,12 @@ import { appendFile, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/pr
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { DiffArgs, DiffResponse, FileContentsResponse } from '../shared/types.ts'
+import type {
+  DiffArgs,
+  DiffHashResponse,
+  DiffResponse,
+  FileContentsResponse,
+} from '../shared/types.ts'
 import { exec, isolateVcsConfig, requireJj } from './testUtil.ts'
 
 // HOME is also where viewed state is stored, and it's read at module load —
@@ -163,6 +168,7 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
     let res = await api('POST', '/api/comment', {
       file: 'g.txt',
       afterLine: 2,
+      lineText: 'two',
       text: 'needs work',
     })
     expect(await res.json()).toEqual({ ok: true })
@@ -180,6 +186,19 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
     expect(await readFile(join(dir, 'g.txt'), 'utf-8')).toBe(before)
   })
 
+  it('refuses a comment when its line changed on disk', async () => {
+    const before = await readFile(join(dir, 'g.txt'), 'utf-8')
+    const res = await api('POST', '/api/comment', {
+      file: 'g.txt',
+      afterLine: 2,
+      lineText: 'one',
+      text: 'needs work',
+    })
+    expect(res.ok).toBe(false)
+    expect(await res.text()).toContain('Line 2 changed on disk')
+    expect(await readFile(join(dir, 'g.txt'), 'utf-8')).toBe(before)
+  })
+
   it("wraps review comments in the file's comment syntax", async () => {
     const diff = await getDiffResponse()
     expect(diff.commentSyntaxes['c.ts']).toEqual({ prefix: '//' })
@@ -187,6 +206,7 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
     let res = await api('POST', '/api/comment', {
       file: 'c.ts',
       afterLine: 1,
+      lineText: 'const one = 1',
       text: 'why one?',
     })
     expect(await res.json()).toEqual({ ok: true })
@@ -234,6 +254,42 @@ describe.each(['git', 'jj'] as const)('startServer (%s integration)', (vcs) => {
   it('rejects malformed requests', async () => {
     const res = await api('POST', '/api/viewed', { file: 'f.txt' }) // missing hash
     expect(res.status).toBe(400)
+  })
+
+  // Last in the block: it edits f.txt and commits, which the tests above
+  // don't expect.
+  it('reports diff changes through /api/diff-hash', async () => {
+    const diffHash = async () => {
+      const res = await fetch(`${url}/api/diff-hash`)
+      expect(res.status).toBe(200)
+      return ((await res.json()) as DiffHashResponse).hash
+    }
+    // The ignore file is itself part of the diff, so add it before the baseline.
+    await writeFile(join(dir, '.gitignore'), 'ignored.log\n')
+    const before = await diffHash()
+    const diff = await getDiffResponse()
+    expect(diff.poll).toBe(true)
+    expect(diff.patchHash).toBe(before)
+    expect(await diffHash()).toBe(before)
+
+    await writeFile(join(dir, 'ignored.log'), 'noise\n')
+    expect(await diffHash()).toBe(before)
+
+    // No jj command in between: the diff's own working-copy snapshot has to
+    // pick the edit up.
+    await appendFile(join(dir, 'f.txt'), 'edited by someone else\n')
+    const edited = await diffHash()
+    expect(edited).not.toBe(before)
+
+    // Moving the diff's endpoint changes it too: the diff is of HEAD (git) or
+    // @ (jj), and both now point at an empty change.
+    if (vcs === 'git') {
+      await run('git', ['add', '.'])
+      await run('git', ['commit', '-qm', 'more'])
+    } else {
+      await run('jj', ['new'])
+    }
+    expect(await diffHash()).not.toBe(edited)
   })
 
   // Bad diff args should fail startServer itself, before the first /api/diff.
