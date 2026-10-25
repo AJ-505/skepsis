@@ -48,11 +48,12 @@ import type {
   LineAnnotation,
   SelectedLineRange,
 } from '@pierre/diffs'
-import { THEME_MODES } from '../shared/types.ts'
+import { THEME_MODES, TOKEN_HEADER } from '../shared/types.ts'
 import type {
   CommentRequest,
   DiffHashResponse,
   DiffResponse,
+  SendRequest,
   ErrorResponse,
   FileContentsResponse,
   ThemeMode,
@@ -70,7 +71,15 @@ import {
 import { diffChanges, type FileChange } from './diffChanges.ts'
 import { lineText as diffLineText, relocateLine } from './lineAnchor.ts'
 
-const queryClient = new QueryClient()
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // React Query's default of three retries, except for a missing token,
+      // which no retry fixes.
+      retry: (failures, error) => !isTokenError(error) && failures < 3,
+    },
+  },
+})
 
 // Always the dual theme: the highlighter tokenizes both up front and switching
 // themes is purely a CSS flip (a single theme would retokenize on every
@@ -172,18 +181,57 @@ function useSystemDark(): boolean {
   }, systemDark)
 }
 
+// The server's per-run token, which every API request carries. It arrives in
+// the `#token=` fragment of the URL skepsis opens; kept in localStorage, which
+// is per origin (this host and port), so reloads and new tabs on the bare URL
+// still work. Dropped from the address bar so it isn't copied or bookmarked.
+const TOKEN_KEY = 'skepsis.token'
+const token = ((): string | null => {
+  const fromUrl = new URLSearchParams(window.location.hash.slice(1)).get('token')
+  if (fromUrl) {
+    try {
+      localStorage.setItem(TOKEN_KEY, fromUrl)
+    } catch {
+      // Blocked storage: this tab still has it.
+    }
+    const { pathname, search } = window.location
+    history.replaceState(history.state, '', pathname + search)
+    return fromUrl
+  }
+  try {
+    return localStorage.getItem(TOKEN_KEY)
+  } catch {
+    return null
+  }
+})()
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message)
+  }
+}
+
+/** The server turned the request away for lacking the run's token. */
+const isTokenError = (error: unknown) => error instanceof ApiError && error.status === 401
+
 async function apiFetch<T = unknown>(
   url: string,
   opts: { method: string; body?: unknown } = { method: 'GET' },
 ): Promise<T> {
+  const headers: Record<string, string> = {}
+  if (token) headers[TOKEN_HEADER] = token
+  if (opts.body !== undefined) headers['Content-Type'] = 'application/json'
   const res = await fetch(url, {
     method: opts.method,
-    headers: opts.body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    headers,
     body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   })
   if (!res.ok) {
     const err = (await res.json().catch(() => null)) as ErrorResponse | null
-    throw new Error(err?.error ?? `Request failed (${res.status})`)
+    throw new ApiError(err?.error ?? `Request failed (${res.status})`, res.status)
   }
   return res.json() as Promise<T>
 }
@@ -209,6 +257,7 @@ const isMac = /mac/i.test(
 )
 const SEARCH_KEYS = isMac ? '⌘K' : 'Ctrl+K'
 const SUBMIT_KEYS = isMac ? '⌘⏎' : 'Ctrl+Enter'
+const INLINE_KEYS = isMac ? '⌥⌘⏎' : 'Ctrl+Alt+Enter'
 
 function useToast(duration = 1400) {
   const [toast, setToast] = useState<{
@@ -235,6 +284,17 @@ type AnnotationMeta =
   | { type: 'review'; startLine: number; endLine: number; file: string }
   | { type: 'composing'; file: string }
   | { type: 'notice'; message: string }
+  | { type: 'sent'; sent: SentComment }
+
+/** A comment that went through --send. The page keeps these until reload, in
+ *  the diff where they were written, so there's a record of what was sent. */
+type SentComment = {
+  id: number
+  file: string
+  side: Side
+  lines: [number, number]
+  text: string
+}
 
 /** Walk the addition side of a diff and find <review>...</review> blocks.
  *  Bare-fallback files get bare tags on insert, so detection matches bare tag
@@ -460,10 +520,14 @@ const DIFF_CSS = `
       );
     }
   }
-  /* The comment "+" only works on the additions side (comments are inserted
-     after an addition/context line in the new file). Hide it on the deletions
-     side — the whole left column in split mode, and change-deletion lines in
-     unified mode — so it doesn't appear where clicking is a no-op. */
+`
+
+/* Without --send, the comment "+" only works on the additions side (comments
+   are inserted after an addition/context line in the new file). Hide it on the
+   deletions side — the whole left column in split mode, and change-deletion
+   lines in unified mode — so it doesn't appear where clicking is a no-op.
+   With --send, either side can be sent. */
+const ADDITIONS_ONLY_CSS = `
   [data-deletions] [data-gutter-utility-slot],
   [data-line-type='change-deletion'] [data-gutter-utility-slot] {
     display: none !important;
@@ -528,23 +592,107 @@ function reviewRanges(
 type ActiveLineTarget = { setEditorActiveLine(lineNumber: number | null): void }
 
 type ButtonProps = {
-  variant?: 'primary' | 'secondary'
+  variant?: 'primary' | 'secondary' | 'ghost'
   onClick: () => void
   disabled?: boolean
+  title?: string
   children: React.ReactNode
 }
 
-function Button({ variant = 'secondary', onClick, disabled, children }: ButtonProps) {
+function Button({
+  variant = 'secondary',
+  onClick,
+  disabled,
+  title,
+  children,
+}: ButtonProps) {
   return (
     <button
       type="button"
       className={`btn btn-${variant}`}
       onClick={onClick}
       disabled={disabled}
+      title={title}
     >
       {children}
     </button>
   )
+}
+
+type Side = 'additions' | 'deletions'
+
+/** Where to show a sent comment on `line`: that line while the diff shows it,
+ *  else the nearest line it does show, so an edit that moves the hunk (as the
+ *  agent's answer often will) doesn't take the comment off the page. Null
+ *  when the side has no lines at all. */
+function nearestLine(fileDiff: FileDiffMetadata, side: Side, line: number): number | null {
+  if (!fileDiff.isPartial) {
+    const lines = side === 'additions' ? fileDiff.additionLines : fileDiff.deletionLines
+    return lines.length ? Math.min(Math.max(line, 1), lines.length) : null
+  }
+  let best: number | null = null
+  for (const h of fileDiff.hunks) {
+    const start = side === 'additions' ? h.additionStart : h.deletionStart
+    const count = side === 'additions' ? h.additionCount : h.deletionCount
+    if (!count) continue
+    const n = Math.min(Math.max(line, start), start + count - 1)
+    if (best === null || Math.abs(n - line) < Math.abs(best - line)) best = n
+  }
+  return best
+}
+
+const stripNewline = (line: string | undefined) => (line ?? '').replace(/\r?\n$/, '')
+
+/** The blob ID of a side of a file as the page shows it. git writes a side
+ *  with no blob (an added file's old side) as all zeros, and a pure rename
+ *  has no IDs at all. */
+function sideBlob(fileDiff: FileDiffMetadata, side: Side): string | null {
+  const id = side === 'deletions' ? fileDiff.prevObjectId : fileDiff.newObjectId
+  return id && !/^0+$/.test(id) ? id : null
+}
+
+/** The lines a sent comment covers, with a little context, and the excerpt's
+ *  first and last line: for the far end to find the spot by once line numbers
+ *  drift, and to tell the lines commented on from the context. A partial diff
+ *  can hide lines in the middle, so the excerpt comes in runs of consecutive
+ *  lines. */
+function lineContext(
+  fileDiff: FileDiffMetadata,
+  side: Side,
+  first: number,
+  last: number,
+  context = 2,
+): SendRequest['code'] {
+  const lines = side === 'additions' ? fileDiff.additionLines : fileDiff.deletionLines
+  const out: [number, string][] = []
+  // A whole-file diff holds every line in order, expanded ones included.
+  if (!fileDiff.isPartial) {
+    const start = Math.max(1, first - context)
+    const end = Math.min(lines.length, last + context)
+    for (let n = start; n <= end; n++) out.push([n, stripNewline(lines[n - 1])])
+  } else {
+    for (const h of fileDiff.hunks) {
+      const start = side === 'additions' ? h.additionStart : h.deletionStart
+      const count = side === 'additions' ? h.additionCount : h.deletionCount
+      const index = side === 'additions' ? h.additionLineIndex : h.deletionLineIndex
+      for (let i = 0; i < count; i++) {
+        const n = start + i
+        if (n >= first - context && n <= last + context)
+          out.push([n, stripNewline(lines[index + i])])
+      }
+    }
+  }
+  if (!out.length) return null
+  const runs: [number, string][][] = []
+  for (const entry of out) {
+    const run = runs.at(-1)
+    if (run && run.at(-1)![0] === entry[0] - 1) run.push(entry)
+    else runs.push([entry])
+  }
+  return runs.map((run) => ({
+    lines: [run[0]![0], run.at(-1)![0]],
+    text: run.map(([, l]) => l).join('\n'),
+  }))
 }
 
 // --- Comment form ---
@@ -553,6 +701,8 @@ function CommentForm({
   initialText,
   onTextChange,
   onSubmit,
+  onSend,
+  inlineUnavailable,
   onCancel,
   submitting,
   error,
@@ -562,7 +712,13 @@ function CommentForm({
    *  the parent keeps the text and hands it back. */
   initialText: string
   onTextChange: (text: string) => void
+  /** Write a `<review>` marker into the file */
   onSubmit: (text: string) => void
+  /** With --send: send to the command. Then the submit keys send and the
+   *  inline keys write a marker. */
+  onSend?: (text: string) => void
+  /** Why a marker can't be written here, if it can't */
+  inlineUnavailable: string | null
   onCancel: () => void
   submitting: boolean
   error: string | null
@@ -578,11 +734,13 @@ function CommentForm({
     ref.current?.focus()
   }, [])
 
-  const submit = () => {
+  const run = (action: ((text: string) => void) | undefined) => {
     const body = text.trim()
-    if (!body || submitting) return
-    onSubmit(body)
+    if (action && body && !submitting) action(body)
   }
+  // Without --send, a marker is the only thing the box can do, and the box
+  // only opens where it can.
+  const inline = inlineUnavailable ? undefined : onSubmit
 
   return (
     <div className="comment-form" onClick={(e) => e.stopPropagation()}>
@@ -596,17 +754,23 @@ function CommentForm({
         onKeyDown={(e) => {
           if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
             e.preventDefault()
-            submit()
+            run(onSend ? (e.altKey ? inline : onSend) : onSubmit)
           }
           if (e.key === 'Escape') onCancel()
         }}
-        placeholder={`Leave a review comment... (${SUBMIT_KEYS} to submit)`}
+        placeholder={`Leave a review comment... (${
+          onSend ? `${SUBMIT_KEYS} sends` : `${SUBMIT_KEYS} to submit`
+        })`}
         rows={3}
         disabled={submitting}
       />
       <div className="comment-form-actions">
         <div className="comment-form-note">
-          {syntax === null ? (
+          {/* The marker only matters to an inline comment, so where there
+              can't be one, the note says why instead. */}
+          {inlineUnavailable ? (
+            inlineUnavailable
+          ) : syntax === null ? (
             <>Comment marker: none (file type not recognized)</>
           ) : syntax.prefix === '' ? (
             <>Comment marker: none (plain text)</>
@@ -621,12 +785,36 @@ function CommentForm({
         </div>
         {error && <div className="comment-form-error">{error}</div>}
         <div className="comment-form-buttons">
-          <Button onClick={onCancel} disabled={submitting}>
+          <Button variant="ghost" onClick={onCancel} disabled={submitting}>
             Cancel
           </Button>
-          <Button variant="primary" disabled={!text.trim() || submitting} onClick={submit}>
-            Comment
-          </Button>
+          {onSend ? (
+            <>
+              <Button
+                disabled={!text.trim() || submitting || !inline}
+                onClick={() => run(inline)}
+                title={`Write the comment into the file as a review marker (${INLINE_KEYS})`}
+              >
+                Comment
+              </Button>
+              <Button
+                variant="primary"
+                disabled={!text.trim() || submitting}
+                onClick={() => run(onSend)}
+                title={`Send the comment to the --send command (${SUBMIT_KEYS})`}
+              >
+                Send
+              </Button>
+            </>
+          ) : (
+            <Button
+              variant="primary"
+              disabled={!text.trim() || submitting}
+              onClick={() => run(onSubmit)}
+            >
+              Comment
+            </Button>
+          )}
         </div>
       </div>
     </div>
@@ -1122,7 +1310,8 @@ function Modal({ onClose, children }: { onClose: () => void; children: React.Rea
   )
 }
 
-const SHORTCUTS: [string, string][] = [
+/** Keys, description, and whether the entry is only for --send */
+const SHORTCUTS: [string, string, 'send'?][] = [
   ['j / k', 'Next / previous line'],
   ['n / p', 'Next / previous file'],
   ['v', 'Toggle viewed'],
@@ -1132,18 +1321,20 @@ const SHORTCUTS: [string, string][] = [
   ['b', 'Toggle file tree'],
   [SEARCH_KEYS, 'Search files'],
   ['c', 'Comment on line'],
+  [SUBMIT_KEYS, 'Send the comment to the --send command', 'send'],
+  [INLINE_KEYS, 'Comment in the file (review marker)', 'send'],
   ['r', 'Refresh after the diff changes on disk'],
   ['Esc', 'Close / cancel'],
   ['?', 'Toggle this help'],
 ]
 
-function HelpModal({ onClose }: { onClose: () => void }) {
+function HelpModal({ onClose, send }: { onClose: () => void; send: boolean }) {
   return (
     <Modal onClose={onClose}>
       <h3>Keyboard Shortcuts</h3>
       <table>
         <tbody>
-          {SHORTCUTS.map(([keys, desc]) => (
+          {SHORTCUTS.filter(([, , only]) => !only || send).map(([keys, desc]) => (
             <tr key={keys}>
               <td>
                 {keys.split(' / ').map((k, i) => (
@@ -1197,13 +1388,17 @@ function CommentsModal({ onClose, vcs }: { onClose: () => void; vcs: 'jj' | 'git
 function CommentsDisabledBanner({
   onLearnMore,
   vcs,
+  send,
 }: {
   onLearnMore: () => void
   vcs: 'jj' | 'git'
+  send: boolean
 }) {
   return (
     <div className="comments-disabled-banner">
-      {vcs === 'jj' ? (
+      {send ? (
+        'Inline comments are off for this diff, but Send still works.'
+      ) : vcs === 'jj' ? (
         <>
           Comments are disabled because the revset does not include <code>@</code>.
         </>
@@ -1336,14 +1531,19 @@ function DiffView() {
   // Files the user expanded via the header's expand-all-lines button: these are
   // re-parsed with whole-file context so every collapsed region is revealed.
   const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({})
-  // The comment box the user opened, with the file's diff it was placed in.
-  // What's shown is `composing`, below, which follows the line into a
-  // refetched diff.
+  // The comment box the user opened: the lines it covers, first to `line`,
+  // and their side (deletions only with --send), with the file's diff it was
+  // placed in. It opens under `line`. What's shown is `composing`, below,
+  // which follows the lines into a refetched diff.
   const [composingState, setComposing] = useState<{
     file: string
+    side: Side
+    first: number
     line: number
     diff: FileDiffMetadata
   } | null>(null)
+  const [sent, setSent] = useState<SentComment[]>([])
+  const sentId = useRef(0)
   // The open comment box's text. A refetched diff remounts the box, and it
   // starts again from this.
   const draftRef = useRef('')
@@ -1490,6 +1690,18 @@ function DiffView() {
       apiFetch('/api/comment', { method: 'POST', body }),
     onSuccess: () => setComposing(null),
     onSettled: () => qc.invalidateQueries({ queryKey: ['diff'] }),
+  })
+
+  // --send. The box stays open with its draft and the error when a send
+  // fails; when one goes through, the box gives way to the sent comment.
+  const sendMutation = useMutation({
+    mutationFn: (body: SendRequest) => apiFetch('/api/send', { method: 'POST', body }),
+    onSuccess: (_, { file, side, lines, text }) => {
+      setComposing(null)
+      // The page only sends from a line, so these are always set
+      if (file && side && lines)
+        setSent((prev) => [...prev, { id: ++sentId.current, file, side, lines, text }])
+    },
   })
 
   const resolveMutation = useMutation({
@@ -1662,14 +1874,15 @@ function DiffView() {
   }, [files])
 
   const openComposer = useCallback(
-    (file: string, line: number) => {
+    (file: string, side: Side, first: number, line: number) => {
       const diff = files.find((f) => f.name === file)
       if (!diff) return
       commentMutation.reset()
+      sendMutation.reset()
       draftRef.current = ''
-      setComposing({ file, line, diff })
+      setComposing({ file, side, first, line, diff })
     },
-    [files, commentMutation],
+    [files, commentMutation, sendMutation],
   )
   // A refetched diff can move the open comment box's line, or drop it. The
   // box follows the line, and closes when it can't be placed: an open box
@@ -1677,12 +1890,14 @@ function DiffView() {
   // comment there.
   const composing = useMemo(() => {
     if (!composingState) return null
-    const { file, line, diff } = composingState
+    const { file, side, first, line, diff } = composingState
     const fileDiff = files.find((f) => f.name === file)
     if (!fileDiff) return null
     if (fileDiff === diff) return composingState
-    const moved = relocateLine(diff, fileDiff, 'additions', line)
-    return moved === null ? null : { file, line: moved, diff: fileDiff }
+    const moved = relocateLine(diff, fileDiff, side, line)
+    const movedFirst = first === line ? moved : relocateLine(diff, fileDiff, side, first)
+    if (moved === null || movedFirst === null) return null
+    return { file, side, first: movedFirst, line: moved, diff: fileDiff }
   }, [composingState, files])
   // Commit the move or the close in the same render, so the box never shows
   // in its old place. A closed box's draft goes in a toast, since the box
@@ -1748,6 +1963,7 @@ function DiffView() {
   }, [data, viewed])
 
   const commentsEnabled = data?.commentsEnabled ?? false
+  const send = data?.send ?? false
 
   const [showHelp, setShowHelp] = useState(false)
   const [showCommentsInfo, setShowCommentsInfo] = useState(false)
@@ -1850,16 +2066,31 @@ function DiffView() {
           metadata: { type: 'notice', message: notice },
         })
       }
+      // Sent comments go before the box, so a follow-up on the same line
+      // opens under what was already sent.
+      const sentHere: string[] = []
+      for (const s of sent) {
+        if (s.file !== name) continue
+        const line = nearestLine(fileDiff, s.side, s.lines[1])
+        if (line === null) continue
+        annotations.push({
+          side: s.side,
+          lineNumber: line,
+          metadata: { type: 'sent', sent: s },
+        })
+        sentHere.push(`${s.id}@${line}`)
+      }
       if (composing?.file === name) {
         annotations.push({
-          side: 'additions',
+          side: composing.side,
           lineNumber: composing.line,
           metadata: { type: 'composing', file: name },
         })
       }
       const isCollapsed = collapsed[name] ?? false
-      const composingLine = composing?.file === name ? composing.line : -1
-      const key = `${data.fileHashes[name] ?? ''}|${composingLine}|${isCollapsed ? 1 : 0}`
+      const composingLine =
+        composing?.file === name ? `${composing.side}${composing.line}` : -1
+      const key = `${data.fileHashes[name] ?? ''}|${composingLine}|${sentHere.join(',')}|${isCollapsed ? 1 : 0}`
       const prev = versionsRef.current.get(name)
       const changed = !prev || prev.key !== key || prev.fileDiff !== fileDiff
       const version = changed ? (prev?.version ?? 0) + 1 : prev.version
@@ -1873,7 +2104,7 @@ function DiffView() {
         version,
       }
     })
-  }, [files, patchFiles, data, composing, collapsed, commentsEnabled])
+  }, [files, patchFiles, data, composing, sent, collapsed, commentsEnabled])
   itemsRef.current = items
 
   // The header highlight falls back to the first file before any focus exists
@@ -2061,7 +2292,29 @@ function DiffView() {
           </div>
         )
       }
+      if (meta.type === 'sent') {
+        const { id, text } = meta.sent
+        return (
+          <div className="sent-comment">
+            <div className="sent-comment-head">
+              <span className="sent-comment-label">Sent</span>
+              <button
+                type="button"
+                className="sent-comment-dismiss"
+                aria-label="Dismiss"
+                title="Dismiss"
+                onClick={() => setSent((prev) => prev.filter((s) => s.id !== id))}
+              >
+                ×
+              </button>
+            </div>
+            <div className="sent-comment-text">{text}</div>
+          </div>
+        )
+      }
       if (meta.type === 'composing') {
+        const side = composing?.side ?? 'additions'
+        const first = composing?.first ?? annotation.lineNumber
         return (
           <CommentForm
             initialText={draftRef.current}
@@ -2079,14 +2332,38 @@ function DiffView() {
                 text,
               })
             }}
+            onSend={
+              data?.send
+                ? (text) =>
+                    sendMutation.mutate({
+                      file,
+                      side,
+                      lines: [first, annotation.lineNumber],
+                      code:
+                        item.type === 'diff'
+                          ? lineContext(item.fileDiff, side, first, annotation.lineNumber)
+                          : null,
+                      blob: item.type === 'diff' ? sideBlob(item.fileDiff, side) : null,
+                      text,
+                    })
+                : undefined
+            }
+            inlineUnavailable={
+              !commentsEnabled
+                ? 'Inline comments need the diff to end at the working copy'
+                : side === 'deletions'
+                  ? 'Inline comments go on the new side of the diff'
+                  : null
+            }
             onCancel={() => setComposing(null)}
             submitting={
-              commentMutation.isPending && commentMutation.variables?.file === file
+              (commentMutation.isPending && commentMutation.variables?.file === file) ||
+              sendMutation.isPending
             }
             error={
               commentMutation.variables?.file === file && commentMutation.error
                 ? commentMutation.error.message
-                : null
+                : (sendMutation.error?.message ?? null)
             }
             syntax={data?.commentSyntaxes[file] ?? null}
           />
@@ -2094,7 +2371,7 @@ function DiffView() {
       }
       return null
     },
-    [resolveMutation, commentMutation, data],
+    [resolveMutation, commentMutation, sendMutation, data, composing, commentsEnabled],
   )
 
   // Gutter-utility click (start a comment). Routed through a ref so the
@@ -2103,16 +2380,27 @@ function DiffView() {
     (range: SelectedLineRange, item: CodeViewItem<AnnotationMeta>) => void
   >(() => {})
   gutterClickRef.current = (range, item) => {
-    if (!commentsEnabled || range.side !== 'additions') return
+    const side = range.side ?? 'additions'
+    // With --send either side can be sent; otherwise only an inline marker
+    // on the additions side is possible.
+    if (!send && (!commentsEnabled || side !== 'additions')) return
+    // A drag from one side to the other has no single numbering, so it
+    // covers only the line it ended on. Otherwise the box opens under the
+    // last line, as on GitHub.
+    const crossSide = range.endSide != null && range.endSide !== side
+    const first = crossSide ? range.end : Math.min(range.start, range.end)
+    const line = crossSide ? range.end : Math.max(range.start, range.end)
+    const lineSide = crossSide ? range.endSide! : side
     // Block nesting: disallow starting a comment inside an existing review block.
     const insideReview = (item.annotations ?? []).some(
       (a) =>
+        lineSide === 'additions' &&
         a.metadata?.type === 'review' &&
-        range.start >= a.metadata.startLine &&
-        range.start <= a.metadata.endLine,
+        first <= a.metadata.endLine &&
+        line >= a.metadata.startLine,
     )
     if (insideReview) return
-    openComposer(item.id, range.start)
+    openComposer(item.id, lineSide, first, line)
   }
 
   const options = useMemo<CodeViewOptions<AnnotationMeta, undefined>>(
@@ -2149,7 +2437,7 @@ function DiffView() {
       // gap 12 (default 8) separates file cards; 8 read as too tight.
       // paddingBottom is the library default.
       layout: { paddingTop: 0, paddingBottom: 8, gap: 12 },
-      enableGutterUtility: commentsEnabled,
+      enableGutterUtility: commentsEnabled || send,
       // Hydrates a partial diff with full file contents on the first expand
       // click, then re-renders the item itself. Setting it is also what makes
       // the library draw expand controls on partial diffs at all, so leave it
@@ -2166,7 +2454,7 @@ function DiffView() {
             }
           }
         : undefined,
-      unsafeCSS: DIFF_CSS,
+      unsafeCSS: send ? DIFF_CSS : DIFF_CSS + ADDITIONS_ONLY_CSS,
       onGutterUtilityClick: (range, context) => gutterClickRef.current(range, context.item),
       // Re-tag review-comment lines whenever an item (re)renders. Runs per item
       // and re-derives tags from scratch, so pooled/recycled elements never keep
@@ -2192,7 +2480,7 @@ function DiffView() {
         tagReviewLines(node, reviewRanges(context.item.annotations))
       },
     }),
-    [theme, diffStyle, commentsEnabled, expandable],
+    [theme, diffStyle, commentsEnabled, send, expandable],
   )
 
   // Keyboard shortcuts. File navigation (n/p) and the focused-file actions
@@ -2341,7 +2629,7 @@ function DiffView() {
           break
         }
         case 'c': {
-          if (!commentsEnabled || showHelp || composing) break
+          if (!(commentsEnabled || send) || showHelp || composing) break
           e.preventDefault()
           const cur = cursorRef.current
           if (!cur || (collapsed[cur.file] ?? false)) break
@@ -2354,7 +2642,7 @@ function DiffView() {
               cur.line <= a.metadata.endLine,
           )
           if (insideReview) break
-          openComposer(cur.file, cur.line)
+          openComposer(cur.file, 'additions', cur.line, cur.line)
           break
         }
         case 'e': {
@@ -2475,10 +2763,23 @@ function DiffView() {
     toggleTheme,
     diffChanged,
     refreshDiff,
+    send,
+    sendMutation,
   ])
 
   // Error before loading: on a failed fetch react-query settles with `data`
   // undefined, so a loading-first guard would show "Loading..." forever.
+  if (isTokenError(error))
+    return (
+      <div className="error-panel" role="alert">
+        <h1>No valid access token</h1>
+        <p>
+          Open the URL skepsis printed at startup, with the <code>#token=</code> fragment.
+          Once a browser has opened it, the fragment can be left off for the rest of that
+          run.
+        </p>
+      </div>
+    )
   if (error && !data)
     return <pre style={{ color: 'red', padding: 20 }}>{String(error)}</pre>
   if (isLoading || !data) return <div className="empty-diff">Loading...</div>
@@ -2504,6 +2805,7 @@ function DiffView() {
       {!data.commentsEnabled && (
         <CommentsDisabledBanner
           vcs={data.vcs}
+          send={data.send}
           onLearnMore={() => setShowCommentsInfo(true)}
         />
       )}
@@ -2544,7 +2846,7 @@ function DiffView() {
           )}
           {diffChanged && <DiffChangedToast changes={changes} onRefresh={refreshDiff} />}
         </div>
-        {showHelp && <HelpModal onClose={() => setShowHelp(false)} />}
+        {showHelp && <HelpModal send={data.send} onClose={() => setShowHelp(false)} />}
         {showCommentsInfo && (
           <CommentsModal vcs={data.vcs} onClose={() => setShowCommentsInfo(false)} />
         )}

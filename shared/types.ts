@@ -34,6 +34,32 @@ export const commentRequestSchema = z.object({
   text: z.string(),
 })
 
+/** A comment for the --send command. Only `text` is required by the
+ *  contract; the page always anchors it to lines. */
+export const sendRequestSchema = z.object({
+  file: z.string().nullable(),
+  side: z.enum(['additions', 'deletions']).nullable(),
+  lines: z.tuple([z.number().int().positive(), z.number().int().positive()]).nullable(),
+  /** An excerpt around the lines commented on, as runs of consecutive lines
+   *  with each run's first and last line. Lines the diff hides split it. */
+  code: z
+    .array(
+      z.object({
+        lines: z.tuple([z.number().int().positive(), z.number().int().positive()]),
+        text: z.string(),
+      }),
+    )
+    .min(1)
+    .nullable(),
+  /** The blob ID of `side`'s version of the file as the page shows it, the
+   *  version `lines` and `code` come from */
+  blob: z
+    .string()
+    .regex(/^[0-9a-f]+$/)
+    .nullable(),
+  text: z.string().min(1),
+})
+
 export const commentDeleteSchema = z.object({
   file: z.string(),
   line: z.number(),
@@ -50,6 +76,11 @@ export const fileContentsQuerySchema = z.object({
 export type ViewedRequest = z.infer<typeof viewedRequestSchema>
 export type CommentRequest = z.infer<typeof commentRequestSchema>
 export type CommentDeleteRequest = z.infer<typeof commentDeleteSchema>
+export type SendRequest = z.infer<typeof sendRequestSchema>
+
+/** The header every API request carries the per-run token in. The page gets
+ *  the token from the `#token=` fragment of the URL skepsis prints and opens. */
+export const TOKEN_HEADER = 'X-Skepsis-Token'
 
 // --- UI types ---
 
@@ -109,6 +140,8 @@ export interface DiffResponse {
   patchHash: string
   /** Whether the page should poll /api/diff-hash (off with --no-poll). */
   poll: boolean
+  /** Whether --send is set, so the comment box can send */
+  send: boolean
   viewed: ViewedMap
   /** Per-file comment syntax, shown in the comment form. An empty prefix
    *  means the format has no comment syntax (e.g. plain text); null means the

@@ -20,14 +20,19 @@ import { loadViewed, markViewed, unmarkViewed, unmarkViewedAll } from './viewed.
 import { insertComment, removeComment } from './comment.ts'
 import { getCommentSyntaxes } from './commentSyntax.ts'
 import { loadTheme, saveTheme, themeBootScript } from './settings.ts'
+import { newToken, sendGate, tokenMatches } from './gate.ts'
+import { buildPayload, runSend } from './send.ts'
+import type { SendResult } from './send.ts'
 import {
   viewedRequestSchema,
   viewedDeleteSchema,
   viewedDeleteAllSchema,
   commentRequestSchema,
   commentDeleteSchema,
+  sendRequestSchema,
   fileContentsQuerySchema,
   themeRequestSchema,
+  TOKEN_HEADER,
 } from '../shared/types.ts'
 import type {
   DiffHashResponse,
@@ -45,13 +50,33 @@ export async function startServer(opts: {
   cwd: string
   /** Serve /api/diff-hash for the page's change polling. Default true. */
   poll?: boolean
-}): Promise<{ port: number; close: () => void }> {
-  const { diffSource, port = 0, hostname = 'localhost', cwd, poll = true } = opts
+  /** The --send command. Unset, /api/send doesn't exist. */
+  send?: string | null
+  /** Overrides runSend's timeout, for tests */
+  sendTimeoutMs?: number
+}): Promise<{ port: number; token: string; close: () => void }> {
+  const { diffSource, port = 0, hostname = 'localhost', cwd, poll = true, send } = opts
   // Fail fast on bad args by running the exact diff command we'll serve.
   // Result is discarded: /api/diff re-runs it per request to stay fresh.
   await getDiff(diffSource)
 
   const app = new Hono()
+  const token = newToken()
+
+  // Every API call must carry the token (see tokenMatches). The theme boot
+  // script is the exception: a <script src> can't send a header, and all it
+  // gives away is the theme.
+  app.use('/api/*', async (c, next) => {
+    if (c.req.path === '/api/theme.js' || tokenMatches(c.req.header(TOKEN_HEADER), token))
+      return next()
+    return c.json(
+      {
+        error:
+          'This page has no valid token. Open the URL skepsis printed when it started.',
+      } satisfies ErrorResponse,
+      401,
+    )
+  })
 
   app.get('/api/diff', async (c) => {
     const { patch, fileHashes } = await getDiff(diffSource)
@@ -69,6 +94,7 @@ export async function startServer(opts: {
       fileHashes,
       patchHash: patchHash(patch),
       poll,
+      send: !!send,
       viewed,
       commentSyntaxes,
     } satisfies DiffResponse)
@@ -121,6 +147,42 @@ export async function startServer(opts: {
     return c.json({ ok: true } satisfies OkResponse)
   })
 
+  // Runs the --send command, so only the page may call it (see gate.ts).
+  // Sends run one at a time in arrival order, so two quick ones can't reach
+  // the far end swapped.
+  let sendQueue: Promise<SendResult> = Promise.resolve({ ok: true, output: '' })
+  // Known once listening; for SKEPSIS_URL.
+  let serverUrl = ''
+  if (send) {
+    app.post(
+      '/api/send',
+      async (c, next) => {
+        const headers = {
+          host: c.req.header('host'),
+          origin: c.req.header('origin'),
+        }
+        if (!sendGate(headers))
+          return c.json({ error: 'forbidden' } satisfies ErrorResponse, 403)
+        await next()
+      },
+      zValidator('json', sendRequestSchema),
+      async (c) => {
+        // The blob comes from the page with the lines and excerpt, so all
+        // three describe the version on screen even if the file has changed
+        // since. Nothing here awaits, so sends join the queue as they arrive.
+        const payload = buildPayload(diffSource, cwd, c.req.valid('json'))
+        const env = { SKEPSIS_URL: serverUrl, SKEPSIS_ROOT: cwd }
+        const run = () =>
+          runSend(send, payload, { cwd, env, timeoutMs: opts.sendTimeoutMs })
+        const result = sendQueue.then(run, run)
+        sendQueue = result
+        const r = await result
+        if (!r.ok) return c.json({ error: r.error } satisfies ErrorResponse, 502)
+        return c.json({ ok: true } satisfies OkResponse)
+      },
+    )
+  }
+
   app.delete('/api/comment', zValidator('json', commentDeleteSchema), async (c) => {
     const { file, line } = c.req.valid('json')
     await removeComment(cwd, file, line)
@@ -166,10 +228,11 @@ export async function startServer(opts: {
   return new Promise((resolve, reject) => {
     const server = serve({ fetch: app.fetch, port, hostname }, (info) => {
       const assignedPort = typeof info === 'string' ? port : info.port
+      serverUrl = `http://${hostname}:${assignedPort}`
       console.info(
-        `skepsis on http://${hostname}:${assignedPort} (${displayCommand(diffSource)})`,
+        `skepsis on ${serverUrl}/#token=${token} (${displayCommand(diffSource)})`,
       )
-      resolve({ port: assignedPort, close: () => server.close() })
+      resolve({ port: assignedPort, token, close: () => server.close() })
     })
     server.on('error', reject)
   })

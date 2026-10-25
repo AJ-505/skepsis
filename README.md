@@ -7,7 +7,7 @@ A fast, fully local browser-based code review UI. Review your (or your agent's) 
 - Fast even with huge diffs
 - GitHub-style split or unified diff view with syntax highlighting
 - Mark files as viewed
-- Inline review comments are written directly into source files as code comments
+- Inline review comments are written directly into source files as code comments or piped to a specified command
 - Works with [jj](https://jj-vcs.dev/) and git (tries jj first, falls back to git)
 - Vim-style navigation shortcuts (press `?` to see the list)
 
@@ -71,6 +71,11 @@ skepsis opens the page in a browser when it starts on localhost. Pass
 background: once the server is listening, it prints one line to stdout,
 `skepsis on <url> (<diff command>)`.
 
+The URL ends in `#token=…`, a secret made fresh on each run. The page needs it
+to talk to the server, so open that URL, not just the host and port. After that,
+reloads and new tabs on the same address work in that browser; a different
+browser needs the full URL again.
+
 To open it some other way, such as in a particular browser or a window of
 its own, pass `--open-cmd <command>` (or set `SKEPSIS_OPEN` in the
 environment). skepsis runs it with `sh -c`, with the URL appended as the last
@@ -117,11 +122,11 @@ The CLI starts a local HTTP server that shells out to `jj diff`
 or `git diff`, then serves the diff to a React frontend that uses
 [`@pierre/diffs`](https://diffs.com/) to render it with syntax highlighting.
 
-While the page is visible, it reruns the diff every few seconds, and when the
-diff has changed, shows a toast with a Refresh button (or press `r`). It
-lists which files changed and by how many lines. The diff doesn't change
-under you on its own, except when the window regains focus. Pass `--no-poll`
-to turn this off.
+While the page is visible, it reruns the diff every few seconds in the
+background, and again as soon as you come back to the tab. When the diff has
+changed, it shows a toast with a Refresh button and a list of which files
+changed and by how many lines. The displayed diff never changes under you on
+its own. Pass `--no-poll` to turn this off.
 
 The npm package ships compiled CLI/server JavaScript plus a prebuilt frontend
 bundle, so installing or running with `npx` does not build anything. In dev
@@ -142,6 +147,101 @@ in both modes ends at the working copy, so comments are enabled by default.
 Viewed state is stored per file in `~/.local/share/skepsis/` using the file's
 content hash (the git object ID from the diff header). If the file changes, the
 hash no longer matches and it automatically shows as unviewed again.
+
+### Sending comments to another program
+
+`--send <command>` (or `SKEPSIS_SEND` in the environment) adds a **Send** button
+to the comment box, which pipes the comment to a shell command instead
+of writing it into the file. Use it to pass review comments straight to a coding
+agent, a tmux pane, or a log. There is not chat UI in skepsis (yet) so replies
+from the agent will appear in that session, wherever it is. Send works
+in some cases that inline comments can't (because there is no file to write): on
+removed lines, and on diffs that don't end at the working copy. The **Comment**
+button continues to write a `<review>` marker in the file as usual.
+
+The only way to set the command is `--send` or `SKEPSIS_SEND`. skepsis never
+reads it from the repo contents, so reviewing someone else's branch
+can't make it run a command they chose. Only the page skepsis opened can
+trigger a send (see Security below).
+
+skepsis runs the command with `sh -c` in the directory it was started in. The
+command inherits skepsis's environment (which is how the agent samples find
+their session), plus `SKEPSIS_URL`, the page's address, and `SKEPSIS_ROOT`, the
+directory skepsis was started in. It gets the comment on stdin as one line of
+JSON whose `prompt` field is the whole comment as a message. Some sample
+commands to start from:
+
+```sh
+# Claude Code. CLAUDE_CODE_MESSAGING_SOCKET is only set in commands the session
+# runs; from any other shell, use the session's socket path instead
+# (/tmp/cc-socks/<pid of claude>.sock)
+SKEPSIS_SEND='jq -c "{type:\"user\",message:{role:\"user\",content:.prompt}}" | nc -U "$CLAUDE_CODE_MESSAGING_SOCKET"'
+
+# Codex. CODEX_THREAD_ID is likewise only set inside the session
+SKEPSIS_SEND='codex queue --thread "$CODEX_THREAD_ID" --message "$(jq -r .prompt)"'
+
+# a tmux pane named review, pasted so newlines don't submit early
+SKEPSIS_SEND='jq -r .prompt | tmux load-buffer -b skepsis - && tmux paste-buffer -p -d -b skepsis -t review && tmux send-keys -t review Enter'
+
+# a log file
+SKEPSIS_SEND='jq -c . >> ~/review-comments.jsonl'
+```
+
+<details>
+<summary>JSON format and exit status</summary>
+
+The JSON sent to stdin looks like this:
+
+````json
+{
+  "version": 1,
+  "root": "/home/me/project",
+  "diff": { "command": "jj diff -r @-", "toWorkingCopy": false },
+  "file": "src/a.ts",
+  "side": "additions",
+  "lines": [42, 45],
+  "code": [{ "lines": [41, 46], "text": "const z = 0\nconst a = 1\n…" }],
+  "blob": "9daeafb",
+  "text": "why two?",
+  "prompt": "Review comment on src/a.ts, lines 42–45 (new side of `jj diff -r @-`), in lines 41–46:\n\n```\nconst z = 0\nconst a = 1\n…\n```\n\nwhy two?"
+}
+````
+
+`side` is `additions` or `deletions`, and `lines` (1-based, inclusive) are in
+that side's numbering. `code` is an excerpt of that side around the lines
+commented on, in runs of consecutive lines, each with its own first and last
+line. There's more than one run when the lines commented on span lines the
+diff doesn't show. `blob` is the ID of the
+version of the file those line numbers refer to (old or new, by `side`), or
+null where the diff has none, as for an added file's old side or a pure
+rename. It's the version on the page, which is older than the file on disk if
+the file changed since the page last refreshed. `prompt` is all of it as plain text, for consumers that only want a
+message.
+
+Exit 0 means the comment was delivered, and the page keeps the comment in the
+diff, under the line it was on, until you dismiss it or reload. skepsis ignores
+stdout. Any other exit, or running past 10 seconds, is a failure: the page shows
+stderr (or the exit status) and keeps the comment in the box. Sends run one at a
+time, in the order they were submitted.
+
+</details>
+
+<details>
+<summary>Notes on security</summary>
+
+A request to `/api/send` can't set the command, but it does pipe arbitrary text
+to it, so lock down who is allowed to hit the endpoint by requiring a token. The
+token is generated per run of the server and passed to the page in the `#token=`
+fragment of the URL it opens. The page keeps it in `localStorage`, which only
+pages on that host and port can read. This keeps out other websites in the
+browser and anything coming in through a forwarded port. It doesn't keep out
+other users on the machine or other processes running as you.
+
+As a backup, `--send` also requires a loopback `--host`, and `/api/send` rejects
+requests whose `Host` isn't a loopback name or whose `Origin`
+isn't the page's own.
+
+</details>
 
 ## Development
 
@@ -178,7 +278,8 @@ npm run ci
 - **minor** — new features: flags, keyboard shortcuts, UI capabilities
 - **major** — breaking changes to anything scriptable or on disk: removed or
   renamed flags, changed flag defaults, changed `<review>` comment or
-  viewed-state formats
+  viewed-state formats, removed or changed fields in the `--send` JSON
+  (adding a field is minor)
 
 ## Releases
 
